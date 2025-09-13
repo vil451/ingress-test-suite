@@ -1,74 +1,92 @@
 package main
 
 import (
-	"ingress-test-suite/k8s"
-	"ingress-test-suite/logger"
-	"ingress-test-suite/pkg/messages"
-	"ingress-test-suite/runner"
-	"ingress-test-suite/test_load"
+	"context"
 	"os"
+	"os/signal"
+	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"ingress-test-suite/internal"
+	"ingress-test-suite/internal/consts"
+	"ingress-test-suite/internal/pkg/logger"
 )
 
 var version = "dev"
 
-var log = logger.GetLogger()
-
-var (
-	testCasesPath string
-)
-
-func init() {
-	testCasesPathEnv := os.Getenv("TESTS_PATH")
-
-	pflag.StringVarP(&testCasesPath,
-		"tests-path", "t", testCasesPathEnv, messages.TestCasesPathMessageString)
-
-	versionFlag := pflag.BoolP("version", "v", false, messages.VersionMessageString)
-	helpFlag := pflag.BoolP("help", "h", false, messages.HelpMessageString)
-
-	pflag.Parse()
-
-	if *helpFlag {
-		log.Infof(messages.Usage)
-		pflag.PrintDefaults()
-		log.Exit(0)
-	}
-
-	if *versionFlag {
-		log.Infof(messages.Version, version)
-	}
-
-	if testCasesPath == "" {
-		log.Fatalf(messages.TestCasesDirPathVariableError)
-	}
-}
-
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	testCases := test_load.LoadDir(testCasesPath)
-	k8sClient := k8s.SetupK8SClient()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
 
-	manager := runner.NewK8sIngressManager(k8sClient)
-	tester := &runner.HTTPTester{}
-	r := runner.NewRunner(manager, tester)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
 
-	results := r.Run(testCases)
+	log := logger.New(logger.InfoLevel)
 
-	var exitCode = 0
+	testCasesPath := parseFlags(log)
 
+	tester, err := internal.NewTester(log)
+	if err != nil {
+		log.Fatalf(err.Error())
+		return
+	}
+
+	results, runErr := tester.Run(ctx, testCasesPath)
+	if runErr != nil {
+		if errors.Is(runErr, consts.ErrMakeK8sClientSet) {
+			log.Fatalf(runErr.Error())
+			log.Exit(31)
+			return
+		}
+
+		log.Fatalf(runErr.Error())
+		log.Exit(1)
+	}
+
+	exitCode := 0
 	for caseName, caseResults := range results {
-		log.Infof(messages.ResultTestCaseInfo, caseName)
+		log.Infof(consts.MessageResultTestCaseInfo, caseName)
 		for _, r := range caseResults {
 			if r.Success {
-				log.Infof(messages.Status, r.Host, r.Path, messages.OK, r.StatusCode)
+				log.Infof(consts.MessageStatus, r.Host, r.Path, consts.MessageOK, r.StatusCode)
 			} else {
-				log.Errorf(messages.Status, r.Host, r.Path, messages.Fail, r.StatusCode)
+				log.Errorf(consts.MessageStatus, r.Host, r.Path, consts.MessageFail, r.StatusCode)
 				exitCode = 12
 			}
 		}
 	}
 
-	log.ExitFunc(exitCode)
+	log.Exit(exitCode)
+}
+
+func parseFlags(log *logger.Logger) string {
+	testCasesPath := ""
+	testCasesPathEnv := os.Getenv("TESTS_PATH")
+	pflag.StringVarP(&testCasesPath,
+		"tests-path", "t", testCasesPathEnv, consts.MessageTestCasesPathDescription)
+	versionFlag := pflag.BoolP("version", "v", false, consts.MessageVersionDescription)
+	helpFlag := pflag.BoolP("help", "h", false, consts.MessageHelp)
+	pflag.Parse()
+
+	if *helpFlag {
+		log.Infof(consts.MessageUsage)
+		pflag.PrintDefaults()
+		log.Exit(0)
+	}
+
+	if *versionFlag {
+		log.Infof(consts.MessageVersion, version)
+	}
+
+	testCasesPath = strings.TrimSpace(testCasesPath)
+	if testCasesPath == "" {
+		log.Fatalf(consts.ErrTestCasesDirPath.Error())
+	}
+	return testCasesPath
 }
